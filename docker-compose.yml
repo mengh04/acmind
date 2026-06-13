@@ -18,13 +18,13 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
-    environment:
-      DATABASE_URL: postgres://acmind:acmind@postgres:5432/acmind
-      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
-      JWT_EXPIRES_IN: "86400"
-      API_PORT: "8080"
-      ALLOW_REGISTER: "true"
-      RUST_LOG: info,acmind_api=debug
+    # Load the whole .env into the container, exactly like a local `cargo run`
+    # (DATABASE_URL, JWT, RATE_LIMIT, LLM_*, …). DATABASE_URL in .env is the
+    # switch that decides which database this stack talks to:
+    #   full local docker  → postgres://acmind:acmind@postgres:5432/acmind
+    #   server / external  → postgres://<user>:<pass>@<host>:<port>/acmind
+    env_file:
+      - .env
     ports: ["8080:8080"]
     depends_on:
       postgres:
