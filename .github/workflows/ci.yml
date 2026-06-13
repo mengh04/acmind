@@ -43,7 +43,7 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
   web:
     name: Web (typecheck + build)
