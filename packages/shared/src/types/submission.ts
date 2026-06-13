@@ -1,4 +1,4 @@
-export type Verdict = "AC" | "WA" | "TLE" | "RE" | "CE" | "PENDING";
+export type Verdict = "AC" | "WA" | "TLE" | "MLE" | "RE" | "CE" | "PENDING";
 
 export interface Submission {
   id: number;

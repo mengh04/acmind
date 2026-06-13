@@ -77,4 +77,6 @@ pub enum Submission {
     MemoryKb,
     Notes,
     SubmittedAt,
+    // Added by m20260612_120000_add_submission_run_id.
+    ExternalRunId,
 }

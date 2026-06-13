@@ -19,6 +19,10 @@ const BROADCAST_INTERVAL_MS = 15000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Marks an error that retrying cannot fix (auth failure, 4xx). The retry loop
+// rethrows it immediately instead of burning all attempts.
+class FatalImportError extends Error {}
+
 let acmindAvailable = false;
 let lastCheck = 0;
 
@@ -73,13 +77,21 @@ async function postToAcmind(endpoint, data, retries = MAX_RETRIES) {
         const result = await resp.json().catch(() => ({}));
         return { success: true, ...result };
       }
-      if (resp.status === 401) throw new Error("认证失败，请检查 JWT Token");
-      const errorText = await resp.text().catch(() => "Unknown error");
-      throw new Error(`服务器错误: ${resp.status} ${errorText}`);
+      // Auth / client errors won't be fixed by retrying — fail fast.
+      if (resp.status === 401) {
+        throw new FatalImportError("认证失败，JWT Token 可能已过期，请重新登录 ACMind");
+      }
+      if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+        const body = await resp.text().catch(() => "");
+        throw new FatalImportError(`请求被拒绝（${resp.status}）：${body || "未知原因"}`);
+      }
+      // 429 (rate limited) / 5xx: transient, fall through to retry.
+      lastError = new Error(`服务器错误: ${resp.status}`);
     } catch (err) {
-      lastError = err;
-      if (attempt < retries - 1) await sleep(RETRY_DELAY_MS * (attempt + 1));
+      if (err instanceof FatalImportError) throw err;
+      lastError = err; // network error / timeout — retryable
     }
+    if (attempt < retries - 1) await sleep(RETRY_DELAY_MS * (attempt + 1));
   }
   throw lastError;
 }
@@ -113,6 +125,10 @@ const importers = {
       submissions_imported: resp.submissions_imported,
       submissions_skipped: resp.submissions_skipped,
       errors: resp.errors,
+      // Carry the scraper's own warnings/stats through to the page so the user
+      // sees partial-success detail (missing source code, empty statement, …).
+      warnings: payload.warnings ?? [],
+      stats: payload.stats ?? null,
     };
   },
 };

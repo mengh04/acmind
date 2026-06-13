@@ -10,6 +10,7 @@ mod m20260608_142216_create_ai_analysis;
 mod m20260609_090000_create_task;
 mod m20260610_090000_create_template;
 mod m20260610_100000_add_template_summary;
+mod m20260612_120000_add_submission_run_id;
 
 pub struct Migrator;
 
@@ -27,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260609_090000_create_task::Migration),
             Box::new(m20260610_090000_create_template::Migration),
             Box::new(m20260610_100000_add_template_summary::Migration),
+            Box::new(m20260612_120000_add_submission_run_id::Migration),
         ]
     }
 }

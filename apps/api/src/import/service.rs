@@ -1,5 +1,5 @@
 use crate::{error::AppResult, import::model::*, state::AppState, tag::repo as tag_repo};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 
 pub struct ImportService<'a> {
@@ -52,9 +52,21 @@ impl<'a> ImportService<'a> {
             let code = sub.code.as_deref().unwrap_or("");
             let runtime_ms = sub.runtime.as_deref().and_then(parse_runtime_ms);
             let memory_kb = sub.memory.as_deref().and_then(parse_memory_kb);
+            let run_id = sub.run_id.as_deref().filter(|s| !s.is_empty());
+            let submitted_at = sub
+                .submit_time
+                .as_deref()
+                .and_then(parse_submit_time)
+                .unwrap_or_else(Utc::now);
 
-            // Skip if duplicate
-            match is_duplicate_submission(db, user_id, problem_id, &verdict, code).await {
+            // Dedup. Prefer the external run id (globally stable, so re-imports are
+            // idempotent regardless of timing). Fall back to code+verdict only when
+            // no run id is available (e.g. manual submissions).
+            let dup = match run_id {
+                Some(rid) => is_duplicate_by_run_id(db, user_id, rid).await,
+                None => is_duplicate_by_code(db, user_id, problem_id, &verdict, code).await,
+            };
+            match dup {
                 Ok(true) => {
                     skipped += 1;
                     continue;
@@ -75,6 +87,8 @@ impl<'a> ImportService<'a> {
                 &verdict,
                 runtime_ms,
                 memory_kb,
+                run_id,
+                submitted_at,
             )
             .await
             {
@@ -187,13 +201,14 @@ async fn insert_submission(
     verdict: &str,
     runtime_ms: Option<i32>,
     memory_kb: Option<i32>,
+    external_run_id: Option<&str>,
+    submitted_at: DateTime<Utc>,
 ) -> AppResult<i64> {
-    let now = Utc::now();
     let stmt = Statement::from_string(
         DbBackend::Postgres,
         format!(
-            r#"INSERT INTO submission (user_id, problem_id, language, code, verdict, runtime_ms, memory_kb, submitted_at)
-               VALUES ({}, {}, '{}', '{}', '{}', {}, {}, '{}')
+            r#"INSERT INTO submission (user_id, problem_id, language, code, verdict, runtime_ms, memory_kb, external_run_id, submitted_at)
+               VALUES ({}, {}, '{}', '{}', '{}', {}, {}, {}, '{}')
                RETURNING id"#,
             user_id,
             problem_id,
@@ -202,7 +217,8 @@ async fn insert_submission(
             verdict.replace('\'', "''"),
             opt_i32(runtime_ms),
             opt_i32(memory_kb),
-            now.to_rfc3339(),
+            opt_str(external_run_id),
+            submitted_at.to_rfc3339(),
         ),
     );
     let row = db.query_one(stmt).await?.ok_or_else(|| {
@@ -212,27 +228,35 @@ async fn insert_submission(
         .map_err(|e| crate::error::AppError::Internal(format!("submission id parse: {e}")))
 }
 
-async fn is_duplicate_submission(
+async fn is_duplicate_by_run_id(
+    db: &DatabaseConnection,
+    user_id: i64,
+    run_id: &str,
+) -> AppResult<bool> {
+    let stmt = Statement::from_string(
+        DbBackend::Postgres,
+        format!(
+            "SELECT 1 AS x FROM submission \
+             WHERE user_id = {} AND external_run_id = '{}' \
+             LIMIT 1",
+            user_id,
+            run_id.replace('\'', "''"),
+        ),
+    );
+    Ok(db.query_one(stmt).await?.is_some())
+}
+
+async fn is_duplicate_by_code(
     db: &DatabaseConnection,
     user_id: i64,
     problem_id: i64,
     verdict: &str,
     code: &str,
 ) -> AppResult<bool> {
+    // No run id to key on. An empty body carries no signal, so never dedup it —
+    // let it through rather than collapsing distinct attempts.
     if code.is_empty() {
-        let stmt = Statement::from_string(
-            DbBackend::Postgres,
-            format!(
-                "SELECT 1 AS x FROM submission \
-                 WHERE user_id = {} AND problem_id = {} AND verdict = '{}' \
-                 AND submitted_at > NOW() - INTERVAL '1 minute' \
-                 LIMIT 1",
-                user_id,
-                problem_id,
-                verdict.replace('\'', "''"),
-            ),
-        );
-        return Ok(db.query_one(stmt).await?.is_some());
+        return Ok(false);
     }
     let code_hash = format!("{:x}", md5::compute(code));
     let stmt = Statement::from_string(
@@ -241,7 +265,6 @@ async fn is_duplicate_submission(
             "SELECT 1 AS x FROM submission \
              WHERE user_id = {} AND problem_id = {} AND verdict = '{}' \
              AND md5(code) = '{}' \
-             AND submitted_at > NOW() - INTERVAL '1 minute' \
              LIMIT 1",
             user_id,
             problem_id,
@@ -262,13 +285,21 @@ fn map_verdict(vjudge_status: &str) -> String {
         "WA".to_string()
     } else if s.contains("TIME LIMIT") || s == "TLE" {
         "TLE".to_string()
-    } else if s.contains("RUNTIME") || s.contains("MEMORY LIMIT") || s == "RE" || s == "MLE" {
+    } else if s.contains("MEMORY LIMIT") || s == "MLE" {
+        "MLE".to_string()
+    } else if s.contains("RUNTIME") || s == "RE" {
         "RE".to_string()
-    } else if s.contains("COMPILATION") || s == "CE" {
+    } else if s.contains("COMPILATION") || s.contains("COMPILE") || s == "CE" {
         "CE".to_string()
     } else {
         "PENDING".to_string()
     }
+}
+
+/// VJudge reports submission time as epoch milliseconds.
+fn parse_submit_time(s: &str) -> Option<DateTime<Utc>> {
+    let ms: i64 = s.trim().parse().ok()?;
+    DateTime::from_timestamp_millis(ms)
 }
 
 fn parse_runtime_ms(s: &str) -> Option<i32> {

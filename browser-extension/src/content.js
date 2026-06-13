@@ -53,24 +53,59 @@ const BAR_STYLE = `
   #acmind-bar .nanobar { background: transparent; }
   #acmind-bar .bar { height: 3px; background: #3498db; transition: width .25s ease, opacity .4s; }
   #acmind-bar.fading .bar { opacity: 0; }
+  #acmind-toasts { position: fixed; top: 12px; right: 12px; z-index: 2147483647;
+    display: flex; flex-direction: column; gap: 8px; max-width: 360px; }
+  .acmind-toast { pointer-events: auto; cursor: pointer; font: 13px/1.5 -apple-system, system-ui, sans-serif;
+    color: #fff; background: #334155; border-radius: 8px; padding: 10px 12px;
+    box-shadow: 0 4px 12px rgba(0,0,0,.18); white-space: pre-wrap;
+    opacity: 0; transform: translateY(-6px); transition: opacity .2s, transform .2s; }
+  .acmind-toast.show { opacity: 1; transform: translateY(0); }
+  .acmind-toast.ok { background: #16a34a; }
+  .acmind-toast.warn { background: #b45309; }
+  .acmind-toast.error { background: #dc2626; }
 `;
 
 let barEl = null;
 let nanobar = null;
 let fadeTimer = null;
 
+function ensureStyle() {
+  if (document.getElementById("acmind-bar-style")) return;
+  const style = document.createElement("style");
+  style.id = "acmind-bar-style";
+  style.textContent = BAR_STYLE;
+  (document.head ?? document.documentElement).appendChild(style);
+}
+
 function ensureBar() {
   if (barEl) return;
-  if (!document.getElementById("acmind-bar-style")) {
-    const style = document.createElement("style");
-    style.id = "acmind-bar-style";
-    style.textContent = BAR_STYLE;
-    document.head.appendChild(style);
-  }
+  ensureStyle();
   barEl = document.createElement("div");
   barEl.id = "acmind-bar";
   document.body.appendChild(barEl);
   nanobar = new Nanobar({ target: barEl });
+}
+
+// Non-blocking toast (replaces alert for non-fatal summaries). Click to dismiss.
+function showToast(message, kind = "ok", durationMs = kind === "ok" ? 4000 : 9000) {
+  ensureStyle();
+  let host = document.getElementById("acmind-toasts");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "acmind-toasts";
+    document.body.appendChild(host);
+  }
+  const el = document.createElement("div");
+  el.className = `acmind-toast ${kind}`;
+  el.textContent = message;
+  const remove = () => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 220);
+  };
+  el.addEventListener("click", remove);
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(remove, durationMs);
 }
 
 function setBarProgress(pct) {
@@ -119,14 +154,18 @@ window.addEventListener("message", (event) => {
       if (msg.requestId !== activeRequestId) return;
       if (typeof msg.pct === "number") setBarProgress(msg.pct);
       return;
-    case BRIDGE_SCRAPE_DATA:
+    case BRIDGE_SCRAPE_DATA: {
       if (msg.requestId !== activeRequestId) return;
       setBarProgress(95);
+      const title = msg.payload?.problem?.title ?? null;
       chrome.runtime
         .sendMessage({ type: BG_IMPORT, payload: msg.payload })
-        .then((resp) => finishImport(resp))
-        .catch((err) => finishImport({ success: false, error: err?.message ?? "后台通信失败" }));
+        .then((resp) => finishImport({ ...resp, title }))
+        .catch((err) =>
+          finishImport({ success: false, error: err?.message ?? "后台通信失败", title }),
+        );
       return;
+    }
     case BRIDGE_SCRAPE_ERROR:
       if (msg.requestId !== activeRequestId) return;
       finishImport({ success: false, error: msg.message });
@@ -136,12 +175,37 @@ window.addEventListener("message", (event) => {
 
 function finishImport(resp) {
   activeRequestId = null;
-  if (resp?.success) {
-    setBarProgress(100);
-    dismissBar(1500);
-  } else {
+  const title = resp?.title;
+
+  if (!resp?.success) {
     dismissBar(0);
-    notifyOnce(resp?.error ?? "导入失败");
+    const reason = resp?.error ?? "未知错误";
+    // Consistent with the success toast; prefix the problem title when known.
+    showToast(`${title ? `${title} ` : ""}导入失败：${reason}`, "error");
+    return;
+  }
+
+  setBarProgress(100);
+  dismissBar(1500);
+
+  // Summarize what actually happened — the bar reaching 100% no longer hides
+  // partial outcomes (0 submissions, missing source, server-side errors).
+  const imported = resp.submissions_imported ?? 0;
+  const skipped = resp.submissions_skipped ?? 0;
+  const warnings = Array.isArray(resp.warnings) ? [...resp.warnings] : [];
+  const serverErrors = Array.isArray(resp.errors) ? resp.errors : [];
+  if (serverErrors.length > 0) {
+    warnings.push(`${serverErrors.length} 条提交入库失败`);
+  }
+
+  const titlePart = title || "题目";
+  let headline = `成功导入 ${titlePart} 和 ${imported} 条提交`;
+  if (skipped > 0) headline += `（跳过 ${skipped} 条重复）`;
+
+  if (warnings.length > 0) {
+    showToast(`${headline}\n· ${warnings.join("\n· ")}`, "warn");
+  } else {
+    showToast(headline, "ok");
   }
 }
 
