@@ -4,19 +4,35 @@ use sea_orm::Database;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-static TEST_STATE: OnceCell<AppState> = OnceCell::const_new();
+// Only a "migrations done" marker — never store a pool here. A sqlx pool is
+// bound to the tokio runtime that created it, and #[tokio::test] gives each
+// test its own runtime; a shared pool hangs (30s acquire timeout) once its
+// origin runtime is torn down.
+static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
-async fn init_test_state() -> AppState {
+async fn connect() -> sea_orm::DatabaseConnection {
     let db_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must be set for integration tests");
-    let db = Database::connect(&db_url)
+    Database::connect(&db_url)
         .await
-        .expect("failed to connect to test database");
-    acmind_migration::Migrator::up(&db, None)
-        .await
-        .expect("failed to run migrations");
+        .expect("failed to connect to test database")
+}
+
+pub async fn test_state() -> AppState {
+    // Run migrations exactly once, on a throwaway connection that is dropped
+    // immediately so no pool outlives the runtime that created it.
+    MIGRATED
+        .get_or_init(|| async {
+            let db = connect().await;
+            acmind_migration::Migrator::up(&db, None)
+                .await
+                .expect("failed to run migrations");
+        })
+        .await;
+
+    // Each test gets its own pool, created in its own runtime.
     AppState {
-        db,
+        db: connect().await,
         jwt_secret: Arc::new("test-secret-for-integration".into()),
         jwt_expires_in: 3600,
         allow_register: true,
@@ -24,10 +40,6 @@ async fn init_test_state() -> AppState {
         rate_limit_burst: 200,
         llm: Arc::new(NoopLlmProvider),
     }
-}
-
-pub async fn test_state() -> AppState {
-    TEST_STATE.get_or_init(init_test_state).await.clone()
 }
 
 pub fn test_router(state: AppState) -> axum::Router {
